@@ -1,21 +1,18 @@
--- TODO: clean up field (re)setting; a bit too messy right now
-
 local logMsgStart = "[Convenient Elders] "
 
 local initialized = false
 local config_path = "convenient_elders_config.json"
 
 local defaults = {
+  modEnabled = false,
   elderBaseSpawnChance = 10,
-  elderDespawnBattleCount = 5,
-  forceSameAreaElder = true
+  elderDespawnBattleCount = 5
 }
 
 local config = {
-  modEnabled = true,            -- Whether mod (features) should be enabled
+  modEnabled = false,           -- Whether mod (features) should be enabled (disabled by default)
   elderBaseSpawnChance = 10,    -- The base appearance rate of a calamitous elder dragon as percentage (0 - 100, default: 10)
-  elderDespawnBattleCount = 5,  -- How many battles until calamitous elder goes away (default: 5)
-  forceSameAreaElder = true     -- Force elder spawns depending on the current stage/location/area (i.e., battles in Azuria should guarantee Namielle)
+  elderDespawnBattleCount = 5   -- How many battles until calamitous elder goes away (default: 5)
 }
 
 --- Valid stage IDs for where calamitous elders can spawn;
@@ -29,15 +26,55 @@ local validStageIDs = {
 
 local stageIDNone = 4117922480  -- If no elders, set it to this value (app.StageDef.StageID_Fixed.None / -177044816 if properly converted to int32)
 
+-- Preferred Catavan destination for each elder area.
+-- Values come from the game's NekoTaxiTable user data.
+local elderAreaCatavan = {
+  [1769129856] = { -- Azuria
+    name = "Mirror Lake",
+    nekoTaxiId = 260838448
+  },
+  [884165440] = { -- Canalta Timberland
+    name = "Mt. Canalta",
+    nekoTaxiId = 1880851584
+  },
+  [1834912896] = { -- Tarkuan
+    name = "Camp: Colossal Dragon's Remains",
+    nekoTaxiId = 2004
+  },
+  [1491992832] = { -- Serathis
+    name = "Glacial Caps: Coastline",
+    nekoTaxiId = 1498
+  }
+}
+
 local stageManager = nil
 local fieldElderController = nil
 local fieldElderUserData = nil
+local setPopElderStageIdMethod = nil
+local lastKnownElderStageId = stageIDNone
+local lastManualSpawnError = nil
+local lastManualSpawnMessage = nil
+local lastManualSpawnMessageUntil = 0
+local originalBasePopRate = nil
+local originalElderEndBattleCount = nil
 
----Sets config values if they exist, otherwise uses default values
+---Loads config while keeping defaults for missing/invalid fields.
 local function load_config()
-  local c = json.load_file(config_path)
-  if c ~= nil then
-    config = c
+  local saved = json.load_file(config_path)
+  if type(saved) ~= "table" then
+    return
+  end
+
+  if type(saved.modEnabled) == "boolean" then
+    config.modEnabled = saved.modEnabled
+  end
+
+  if type(saved.elderBaseSpawnChance) == "number" then
+    config.elderBaseSpawnChance = math.max(0, math.min(100, math.floor(saved.elderBaseSpawnChance)))
+  end
+
+  if type(saved.elderDespawnBattleCount) == "number" then
+    config.elderDespawnBattleCount = math.max(1, math.min(10, math.floor(saved.elderDespawnBattleCount)))
   end
 end
 
@@ -46,20 +83,33 @@ local function save_config()
   json.dump_file(config_path, config)
 end
 
----Handle mod enable/disable toggle
+---Applies the configured natural elder spawn rate to the game.
+---The manual spawn button no longer changes this value.
+local function apply_spawn_rate()
+  if fieldElderUserData then
+    fieldElderUserData:set_field("BasePopRate", config.elderBaseSpawnChance)
+  end
+end
+
+---Applies or restores the elder field settings for the mod toggle.
 ---@param enabled boolean
-local function handleModEnableToggle(enabled)
+local function handle_mod_enable_toggle(enabled)
   if not fieldElderUserData then
     log.error(logMsgStart .. "'app.StageManager._FieldElderCtrl._FieldElderParamUserData' is null; cannot set field values")
     return
   end
 
-  if not enabled then
-    fieldElderUserData:set_field("BasePopRate", defaults.elderBaseSpawnChance)
-    fieldElderUserData:set_field("ElderEndBattleCount", defaults.elderDespawnBattleCount)
-  else
-    fieldElderUserData:set_field("BasePopRate", config.elderBaseSpawnChance)
+  if enabled then
+    apply_spawn_rate()
     fieldElderUserData:set_field("ElderEndBattleCount", config.elderDespawnBattleCount)
+  else
+    if originalBasePopRate ~= nil then
+      fieldElderUserData:set_field("BasePopRate", originalBasePopRate)
+    end
+
+    if originalElderEndBattleCount ~= nil then
+      fieldElderUserData:set_field("ElderEndBattleCount", originalElderEndBattleCount)
+    end
   end
 end
 
@@ -74,6 +124,151 @@ local function has_value(t, val)
   end
 
   return false
+end
+
+
+---Returns the current valid elder area stage ID.
+---If the player is in a temporary sub-area (for example an egg nest),
+---fall back to the previous stage, matching the existing override behavior.
+---@return number|nil
+local function get_current_elder_area_stage_id()
+  if not stageManager then
+    return nil
+  end
+
+  local stage = stageManager:call("get_CurrentStageData()")
+  local stageId = stage and stage:call("get_ID()") or nil
+
+  if not stageId or not has_value(validStageIDs, stageId) then
+    stage = stageManager:call("get_PrevStageData()")
+    stageId = stage and stage:call("get_ID()") or nil
+  end
+
+  if stageId and has_value(validStageIDs, stageId) then
+    return stageId
+  end
+
+  return nil
+end
+
+---Attempts to perform a normal Catavan fast-travel using the game's
+---native StageManager fast-travel state.
+---@param destination table
+---@return boolean, string|nil
+local function try_catavan_teleport_night(destination)
+  if not destination then
+    return false, "No Catavan destination configured for this area."
+  end
+
+  stageManager = sdk.get_managed_singleton("app.StageManager")
+  if not stageManager then
+    return false, "StageManager is unavailable."
+  end
+
+  local stageType = sdk.find_type_definition("app.StageManager")
+  if not stageType then
+    return false, "Could not find app.StageManager."
+  end
+
+  local setFastTravel = stageType:get_method(
+    "set_FastTravel(app.NekoTaxiID.ID_Fixed)"
+  ) or stageType:get_method("set_FastTravel")
+
+  local setFastTravelTimeZone = stageType:get_method(
+    "set_FastTravelTimeZone(app.StageDef.TIME_ZONE_Fixed)"
+  ) or stageType:get_method("set_FastTravelTimeZone")
+
+  local startFastTravel = stageType:get_method("startFastTravel()")
+    or stageType:get_method("startFastTravel")
+
+  if not setFastTravel or not setFastTravelTimeZone or not startFastTravel then
+    return false, "Required native Catavan fast-travel methods are unavailable."
+  end
+
+  -- Runtime-confirmed app.StageDef.TIME_ZONE_Fixed.NIGHT
+  local TIME_ZONE_NIGHT = 16317
+
+  local ok, err = pcall(function()
+    setFastTravel:call(stageManager, destination.nekoTaxiId)
+    setFastTravelTimeZone:call(stageManager, TIME_ZONE_NIGHT)
+    startFastTravel:call(stageManager)
+  end)
+
+  if not ok then
+    return false, tostring(err)
+  end
+
+  log.info(
+    logMsgStart ..
+    "Native Catavan fast travel requested to " .. destination.name ..
+    " (NekoTaxiID " .. tostring(destination.nekoTaxiId) ..
+    ", TIME_ZONE_NIGHT " .. tostring(TIME_ZONE_NIGHT) .. ")"
+  )
+
+  return true, nil
+end
+
+
+local function spawn_elder_in_current_area()
+  lastManualSpawnError = nil
+  lastManualSpawnMessage = nil
+
+  if not config.modEnabled then
+    lastManualSpawnError = "Manual spawning is disabled."
+    return false
+  end
+
+  local stageId = get_current_elder_area_stage_id()
+  if not stageId then
+    lastManualSpawnError = "No Elder can spawn in this area."
+    return false
+  end
+
+  -- Spam protection: if this area's elder is already active, do nothing.
+  if lastKnownElderStageId == stageId then
+    return false
+  end
+
+  if not setPopElderStageIdMethod then
+    lastManualSpawnError = "Could not spawn Elder."
+    return false
+  end
+
+  local ok, err = pcall(function()
+    setPopElderStageIdMethod:call(nil, stageId)
+  end)
+
+  if not ok then
+    lastManualSpawnError = "Could not spawn Elder."
+    log.error(logMsgStart .. "manual elder spawn failed: " .. tostring(err))
+    return false
+  end
+
+  -- The hook below also records this, but set it here as a defensive lock
+  -- so repeated button presses cannot queue duplicate requests.
+  lastKnownElderStageId = stageId
+
+  local destination = elderAreaCatavan[stageId]
+  local warped, warpErr = try_catavan_teleport_night(destination)
+
+  if warped then
+    lastManualSpawnError = nil
+    lastManualSpawnMessage =
+      "Elder spawned. Travelling to " .. destination.name .. " at Night."
+  else
+    lastManualSpawnMessage =
+      "Elder spawned, but fast travel failed."
+
+    if warpErr then
+      lastManualSpawnError = "Fast travel failed."
+      log.error(logMsgStart .. warpErr)
+    end
+  end
+
+  lastManualSpawnMessageUntil = os.clock() + 5.0
+
+  log.info(logMsgStart .. "manually set elder spawn area to StageID_Fixed: " .. tostring(stageId))
+  return true
 end
 
 --- Initialize singletons, config values, etc.
@@ -98,12 +293,19 @@ local function init()
 
   fieldElderUserData = fieldElderController:get_field("_FieldElderParamUserData")
   if not fieldElderUserData then
-    log.error(logMsgStart .. "'could not find 'app.StageManager._FieldElderCtrl.'_FieldElderParamUserData'")
+    log.error(logMsgStart .. "could not find 'app.StageManager._FieldElderCtrl._FieldElderParamUserData'")
     return
   end
 
-  fieldElderUserData:set_field("BasePopRate", config.elderBaseSpawnChance)
-  fieldElderUserData:set_field("ElderEndBattleCount", config.elderDespawnBattleCount)
+  setPopElderStageIdMethod = sdk.find_type_definition("app.cSaveDataHelper_Field"):get_method("setPopElderStageId(app.StageDef.StageID_Fixed)")
+  if not setPopElderStageIdMethod then
+    log.error(logMsgStart .. "could not find 'app.cSaveDataHelper_Field.setPopElderStageId(app.StageDef.StageID_Fixed)'")
+  end
+
+  originalBasePopRate = fieldElderUserData:get_field("BasePopRate")
+  originalElderEndBattleCount = fieldElderUserData:get_field("ElderEndBattleCount")
+
+  handle_mod_enable_toggle(config.modEnabled)
 
   initialized = true
 end
@@ -135,56 +337,32 @@ sdk.hook(
   end
 )
 
--- Elder spawn override hook
-sdk.hook(
-  sdk.find_type_definition("app.cSaveDataHelper_Field"):get_method("setPopElderStageId(app.StageDef.StageID_Fixed)"),
-  function(args)
-    log.debug(logMsgStart .. "setPopElderStageId args[3]: " .. tostring(sdk.to_int64(args[3])))
+-- Track the game's elder state so the manual spawn button cannot be spammed
+-- while the current area's elder is already active.
+local elderHelperType = sdk.find_type_definition("app.cSaveDataHelper_Field")
+local elderStageSetterForHook = elderHelperType and elderHelperType:get_method(
+  "setPopElderStageId(app.StageDef.StageID_Fixed)"
+) or nil
 
-    if not config.modEnabled or not config.forceSameAreaElder then
+if elderStageSetterForHook then
+  setPopElderStageIdMethod = elderStageSetterForHook
+
+  sdk.hook(
+    elderStageSetterForHook,
+    function(args)
+      local requestedStageId = sdk.to_int64(args[3])
+      log.debug(logMsgStart .. "setPopElderStageId: " .. tostring(requestedStageId))
+      lastKnownElderStageId = requestedStageId
       return sdk.PreHookResult.CALL_ORIGINAL
+    end,
+    function(retval)
+      return retval
     end
+  )
+else
+  log.error(logMsgStart .. "could not hook 'app.cSaveDataHelper_Field.setPopElderStageId(app.StageDef.StageID_Fixed)'")
+end
 
-    -- skip early if the elder should despawn
-    if sdk.to_int64(args[3]) == stageIDNone then
-      return sdk.PreHookResult.CALL_ORIGINAL
-    end
-
-    if not stageManager then
-      return sdk.PreHookResult.CALL_ORIGINAL
-    end
-
-    -- get stage id
-    local stage = stageManager:call("get_CurrentStageData()")
-    local stageId = stage:call("get_ID()")
-    log.debug(logMsgStart .. "current StageID_Fixed: " .. tostring(stageId or ""))
-
-    if not stageId or not has_value(validStageIDs, stageId) then  -- current stage invalid (e.g., currently in egg nest); try previous stage
-      stage = stageManager:call("get_PrevStageData()")
-      stageId = stage:call("get_ID()")
-      log.debug(logMsgStart .. "previous StageID_Fixed: " .. tostring(stageId or ""))
-    end
-
-    if not stageId then
-      log.debug(logMsgStart .. "could not get valid StageID_Fixed; not overriding elder spawn")
-      return sdk.PreHookResult.CALL_ORIGINAL
-    end
-
-    -- overwrite stage id param if valid
-    if has_value(validStageIDs, stageId) then
-      log.debug(logMsgStart .. "overriding StageID_Fixed to: " .. tostring(stageId))
-      args[3] = sdk.to_ptr(stageId)
-    end
-
-    -- log.debug(logMsgStart .. "new StageID_Fixed: " .. sdk.to_int64(args[3]))
-
-    return sdk.PreHookResult.CALL_ORIGINAL
-  end,
-  function(retval)
-    -- log.debug(logMsgStart .. "setPopElderStageId(app.StageDef.StageID_Fixed) retval: " .. sdk.to_int64(retval))
-    return retval
-  end
-)
 
 -- init if resetting scripts (i.e., during development)
 if not initialized then
@@ -193,26 +371,24 @@ end
 
 re.on_draw_ui(function()
   if imgui.tree_node("Convenient Elders") then
-    local modEnabledChanged, newModEnabled = imgui.checkbox("Enable mod?", config.modEnabled)
+    local modEnabledChanged, newModEnabled = imgui.checkbox("Enable", config.modEnabled)
     if modEnabledChanged then
       config.modEnabled = newModEnabled
-      handleModEnableToggle(newModEnabled)
+      handle_mod_enable_toggle(newModEnabled)
       save_config()
     end
 
     if config.modEnabled then
-      pre_tooltip("Base chance of a calamitous elder appearing / spawning (n %%); 50 meaning 50 %%\nDefault: 10 (%%)")
+      pre_tooltip("Natural Elder spawn chance. Default: 10%")
       ---@diagnostic disable-next-line: missing-parameter
       local elderBasePopRateChanged, newElderBasePopRate = imgui.slider_int("Base spawn rate (n %)", config.elderBaseSpawnChance, 0, 100)
       if elderBasePopRateChanged then
         config.elderBaseSpawnChance = newElderBasePopRate
-        if fieldElderUserData then
-          fieldElderUserData:set_field("BasePopRate", config.elderBaseSpawnChance)
-        end
+        apply_spawn_rate()
         save_config()
       end
 
-      pre_tooltip("How many battles to require until the calamitous elder despawns / retreats\nDefault: 5")
+      pre_tooltip("Battles before the Elder retreats. Default: 5")
       ---@diagnostic disable-next-line: missing-parameter
       local elderEndBattleCountChanged, newElderEndBattleCount = imgui.slider_int("Battle retreat count", config.elderDespawnBattleCount, 1, 10)
       if elderEndBattleCountChanged then
@@ -223,11 +399,35 @@ re.on_draw_ui(function()
         save_config()
       end
 
-      pre_tooltip("Forces the calamitous elder of the current area to spawn (i.e., Azuria elder in Azuria)")
-      local overrideByLocationChanged, newOverrideByLocation = imgui.checkbox("Force same area elder?", config.forceSameAreaElder)
-      if overrideByLocationChanged then
-        config.forceSameAreaElder = newOverrideByLocation
-        save_config()
+      local currentElderAreaStageId = get_current_elder_area_stage_id()
+      local elderAlreadyInCurrentArea =
+        currentElderAreaStageId ~= nil and
+        lastKnownElderStageId == currentElderAreaStageId
+
+      if not config.modEnabled then
+        imgui.text("Status: Manual spawning disabled.")
+      elseif currentElderAreaStageId == nil then
+        imgui.text("Status: No Elder can spawn in this area.")
+      elseif elderAlreadyInCurrentArea then
+        imgui.text("Status: Elder already active in this area.")
+      else
+        imgui.text("Status: Elder can spawn in this area.")
+
+        if imgui.button("Spawn Elder") then
+          spawn_elder_in_current_area()
+        end
+      end
+
+      if lastManualSpawnError then
+        imgui.text(lastManualSpawnError)
+      end
+
+      if lastManualSpawnMessage then
+        if os.clock() <= lastManualSpawnMessageUntil then
+          imgui.text(lastManualSpawnMessage)
+        else
+          lastManualSpawnMessage = nil
+        end
       end
     end
 
