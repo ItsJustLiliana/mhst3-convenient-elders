@@ -10,9 +10,9 @@ local defaults = {
 }
 
 local config = {
-  modEnabled = false,           -- Whether mod (features) should be enabled (disabled by default)
-  elderBaseSpawnChance = 10,    -- The base appearance rate of a calamitous elder dragon as percentage (0 - 100, default: 10)
-  elderDespawnBattleCount = 5   -- How many battles until calamitous elder goes away (default: 5)
+  modEnabled = false,          -- Whether mod (features) should be enabled (disabled by default)
+  elderBaseSpawnChance = 10,   -- The base appearance rate of a calamitous elder dragon as percentage (0 - 100, default: 10)
+  elderDespawnBattleCount = 5  -- How many battles until calamitous elder goes away (default: 5)
 }
 
 --- Valid stage IDs for where calamitous elders can spawn;
@@ -29,19 +29,19 @@ local stageIDNone = 4117922480  -- If no elders, set it to this value (app.Stage
 -- Preferred Catavan destination for each elder area.
 -- Values come from the game's NekoTaxiTable user data.
 local elderAreaCatavan = {
-  [1769129856] = { -- Azuria
+  [1769129856] = {  -- Azuria
     name = "Mirror Lake",
     nekoTaxiId = 260838448
   },
-  [884165440] = { -- Canalta Timberland
+  [884165440] = {  -- Canalta Timberland
     name = "Mt. Canalta",
     nekoTaxiId = 1880851584
   },
-  [1834912896] = { -- Tarkuan
+  [1834912896] = {  -- Tarkuan
     name = "Camp: Colossal Dragon's Remains",
     nekoTaxiId = 2004
   },
-  [1491992832] = { -- Serathis
+  [1491992832] = {  -- Serathis
     name = "Glacial Caps: Coastline",
     nekoTaxiId = 1498
   }
@@ -257,7 +257,7 @@ local function spawn_elder_in_current_area()
       "Elder spawned. Travelling to " .. destination.name .. " at Night."
   else
     lastManualSpawnMessage =
-      "Elder spawned, but fast travel failed."
+    "Elder spawned, but fast travel failed."
 
     if warpErr then
       lastManualSpawnError = "Fast travel failed."
@@ -413,6 +413,7 @@ re.on_draw_ui(function()
       else
         imgui.text("Status: Elder can spawn in this area.")
 
+        pre_tooltip("Spawns the Elder for your current area and fast-travels you to a nearby Catavan at Night.")
         if imgui.button("Spawn Elder") then
           spawn_elder_in_current_area()
         end
